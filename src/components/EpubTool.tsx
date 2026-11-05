@@ -2,9 +2,15 @@
 
 import { useEffect, useState } from "react";
 import { splitChapters, type Chapter } from "@/lib/splitter";
-import { openTextFile, type LoadedFile } from "@/lib/fileio";
+import {
+  openTextFile,
+  saveTextFile,
+  chaptersToText,
+  type LoadedFile,
+} from "@/lib/fileio";
 import { isTauri } from "@/lib/tauri";
 import { countWords } from "@/lib/wordcount";
+import WebDownloader, { type WebChapter } from "./WebDownloader";
 
 function extractError(err: unknown): string {
   const raw = err instanceof Error ? err.message : String(err);
@@ -16,17 +22,39 @@ function extractError(err: unknown): string {
   return colon >= 0 ? after.slice(colon + 1).trim() : raw;
 }
 
+/** 计算当前章节合并文本与原文件快照是否不同。 */
+function computeDirty(file: LoadedFile | null, chapters: Chapter[]): boolean {
+  if (!file) return false;
+  return chaptersToText(chapters).trimEnd() !== file.text.trimEnd();
+}
+
 export default function EpubTool() {
   const [file, setFile] = useState<LoadedFile | null>(null);
   const [chapters, setChapters] = useState<Chapter[]>([]);
   const [selected, setSelected] = useState(0);
   const [mode, setMode] = useState<"auto" | "manual">("auto");
+  const [source, setSource] = useState<"local" | "web">("local");
   const [levels, setLevels] = useState<string[]>(["部", "章", "节"]);
   const [paren, setParen] = useState(true);
   const [manualType, setManualType] = useState<"text" | "regex">("text");
   const [feature, setFeature] = useState("");
   const [toast, setToast] = useState<string | null>(null);
   const [exporting, setExporting] = useState(false);
+  const [saving, setSaving] = useState(false);
+
+  const dirty = computeDirty(file, chapters);
+
+  // Cmd/Ctrl+S 触发保存
+  useEffect(() => {
+    function onKey(e: KeyboardEvent) {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "s") {
+        e.preventDefault();
+        void handleSave();
+      }
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [file, chapters]);
 
   // 自动分章：加载文件或层级配置变化时重新分章
   useEffect(() => {
@@ -135,6 +163,47 @@ export default function EpubTool() {
     );
   }
 
+  async function handleSave() {
+    if (!file || chapters.length === 0) {
+      setToast("请先加载文件");
+      return;
+    }
+    if (!dirty) {
+      setToast("内容未修改");
+      return;
+    }
+    const text = chaptersToText(chapters);
+    setSaving(true);
+    try {
+      const savedPath = await saveTextFile(text, {
+        name: file.name,
+        path: file.path,
+      });
+      if (savedPath) {
+        // 保存成功后用当前内容刷新"原文件快照"，使 dirty 归零
+        setFile({ ...file, text });
+        setToast("保存成功");
+      }
+    } catch (err) {
+      setToast(extractError(err));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  /** 网页下载完成回调：把 WebChapter 转成 Chapter，并入状态 */
+  function handleWebLoaded(bookTitle: string, webChapters: WebChapter[]) {
+    const ch: Chapter[] = webChapters.map((c, i) => ({
+      title: c.title,
+      lines: c.lines,
+      startLine: i,
+    }));
+    setChapters(ch);
+    setSelected(0);
+    setFile({ name: bookTitle + ".txt", text: "" });
+    setToast(`已加载 ${ch.length} 章：${bookTitle}`);
+  }
+
   const current = chapters[selected];
 
   return (
@@ -142,10 +211,26 @@ export default function EpubTool() {
       <header className="toolbar">
         <h1>TXT 分章导出 EPUB</h1>
         <span className="file-info">
-          {file ? `${file.name} · ${chapters.length} 章` : "未加载文件"}
+          {file ? (
+            <>
+              {file.name}
+              {dirty ? <span className="dirty-mark">•</span> : null} ·{" "}
+              {chapters.length} 章
+            </>
+          ) : (
+            "未加载文件"
+          )}
         </span>
         <button className="btn" onClick={handleOpen}>
           打开文件
+        </button>
+        <button
+          className="btn"
+          onClick={handleSave}
+          disabled={saving || !file || !dirty}
+          title="Cmd/Ctrl+S"
+        >
+          {saving ? "保存中…" : dirty ? "保存" : "已保存"}
         </button>
         <button
           className="btn primary"
@@ -158,6 +243,25 @@ export default function EpubTool() {
 
       <div className="body">
         <aside className="sidebar">
+          {/* 来源切换 */}
+          <div className="source-tabs">
+            <button
+              className={"source-tab" + (source === "local" ? " active" : "")}
+              onClick={() => setSource("local")}
+            >
+              本地文件
+            </button>
+            <button
+              className={"source-tab" + (source === "web" ? " active" : "")}
+              onClick={() => setSource("web")}
+            >
+              网页下载
+            </button>
+          </div>
+
+          {source === "web" ? (
+            <WebDownloader active={source === "web"} onLoaded={handleWebLoaded} />
+          ) : (
           <div className="split-controls">
             <div className="mode-row">
               <label>
@@ -260,6 +364,7 @@ export default function EpubTool() {
               </>
             )}
           </div>
+          )}
 
           <div className="chapter-list">
             {chapters.map((c, i) => (

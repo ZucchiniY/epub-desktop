@@ -52,9 +52,6 @@ pub fn generate_epub(
     author: Option<String>,
     chapters: Vec<ChapterInput>,
 ) -> Result<(), String> {
-    if chapters.is_empty() {
-        return Err("没有可导出的章节".into());
-    }
     use epub_builder::{EpubBuilder, EpubContent, EpubVersion, ReferenceType, ZipLibrary};
     use std::fs::File;
 
@@ -148,7 +145,7 @@ mod tests {
     }
 
     #[test]
-    fn test_empty_chapters_err() {
+    fn test_empty_chapters_creates_blank_epub() {
         let path = test_path();
         let _ = std::fs::remove_file(&path);
         let result = generate_epub(
@@ -157,6 +154,20 @@ mod tests {
             Some("作者A".into()),
             vec![],
         );
-        assert!(result.is_err(), "空章节应返回 Err");
+        assert!(result.is_ok(), "空章节应能生成空白 epub: {:?}", result);
+
+        let bytes = std::fs::read(&path).expect("读取生成的 epub 文件失败");
+        assert_eq!(
+            &bytes[0..4],
+            b"PK\x03\x04",
+            "空白 epub 也应是合法的 zip 文件"
+        );
+
+        let doc = epub::doc::EpubDoc::new(&path).expect("用 epub 库打开空白 epub 失败");
+        assert_eq!(
+            doc.mdata("title").map(|m| m.value.as_str()),
+            Some("测试书名")
+        );
+        assert_eq!(doc.spine.len(), 0);
     }
 }
