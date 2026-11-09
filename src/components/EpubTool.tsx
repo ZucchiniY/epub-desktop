@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import Link from "next/link";
 import { splitChapters, type Chapter } from "@/lib/splitter";
 import {
   openTextFile,
@@ -239,6 +240,9 @@ export default function EpubTool() {
         >
           {exporting ? "导出中…" : "导出 EPUB"}
         </button>
+        <Link className="btn" href="/settings/">
+          设置
+        </Link>
       </header>
 
       <div className="body">

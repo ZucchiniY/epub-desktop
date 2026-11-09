@@ -155,6 +155,37 @@ input {
   cursor: not-allowed;
 }
 
+/* Link 渲染为 <a>，按按钮样式展示 */
+a.btn {
+  display: inline-block;
+  text-decoration: none;
+  line-height: 1.4;
+}
+
+/* 设置页 */
+.settings-body {
+  padding: 24px 20px;
+  max-width: 560px;
+}
+
+.settings-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+
+.settings-row label {
+  font-size: 13px;
+  color: #374151;
+  white-space: nowrap;
+}
+
+.settings-input {
+  width: 100px;
+  margin-bottom: 0;
+}
+
 /* 层级编辑器 */
 .level-hint {
   font-size: 12px;

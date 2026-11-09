@@ -89,13 +89,13 @@ pub fn generate_epub(
 mod tests {
     use super::*;
 
-    fn test_path() -> std::path::PathBuf {
-        std::env::temp_dir().join("epub_gen_test.epub")
+    fn test_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("epub_gen_test_{name}.epub"))
     }
 
     #[test]
     fn test_generate_and_read_back() {
-        let path = test_path();
+        let path = test_path("normal");
         let _ = std::fs::remove_file(&path);
 
         let chapters = vec![
@@ -146,7 +146,7 @@ mod tests {
 
     #[test]
     fn test_empty_chapters_creates_blank_epub() {
-        let path = test_path();
+        let path = test_path("blank");
         let _ = std::fs::remove_file(&path);
         let result = generate_epub(
             path.to_string_lossy().into_owned(),

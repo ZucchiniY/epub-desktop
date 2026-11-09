@@ -30,6 +30,15 @@ pub enum FetchError {
     Request(String),
     Parse(String),
     Url(String),
+    /// 页面拿到了，但没有正文（站点错误页 / 空白容器），可重试
+    Empty(String),
+}
+
+impl FetchError {
+    /// 是否值得重试：网络错误与空正文通常是站点偶发问题。
+    fn retryable(&self) -> bool {
+        matches!(self, FetchError::Request(_) | FetchError::Empty(_))
+    }
 }
 
 impl std::fmt::Display for FetchError {
@@ -38,6 +47,7 @@ impl std::fmt::Display for FetchError {
             FetchError::Request(msg) => write!(f, "请求失败：{}", msg),
             FetchError::Parse(msg) => write!(f, "解析失败：{}", msg),
             FetchError::Url(msg) => write!(f, "地址无效：{}", msg),
+            FetchError::Empty(msg) => write!(f, "正文为空：{}", msg),
         }
     }
 }
@@ -76,14 +86,43 @@ fn request_error(url: &str, e: reqwest::Error) -> FetchError {
     FetchError::Request(format!("{} | {}", url, chain.join(" => ")))
 }
 
+/// 复用一个客户端：复用 TCP/TLS 连接，显著减少抓取上千章时的握手开销与偶发失败。
+fn http_client() -> &'static reqwest::blocking::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::blocking::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::blocking::Client::builder()
+            .user_agent(UA)
+            .timeout(std::time::Duration::from_secs(30))
+            .pool_idle_timeout(std::time::Duration::from_secs(60))
+            .build()
+            .unwrap_or_else(|_| reqwest::blocking::Client::new())
+    })
+}
+
+/// 最多尝试 3 次；网络错误与空正文会退避重试，解析/地址错误直接返回。
+fn with_retry<T>(mut f: impl FnMut() -> Result<T, FetchError>) -> Result<T, FetchError> {
+    let mut last_err: Option<FetchError> = None;
+    for attempt in 0..3u64 {
+        if attempt > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(400 * attempt));
+        }
+        match f() {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                let retryable = e.retryable();
+                last_err = Some(e);
+                if !retryable {
+                    break;
+                }
+            }
+        }
+    }
+    Err(last_err.expect("至少尝试一次"))
+}
+
 /// 发送请求，带编码回退：先按 UTF-8 解码，失败用 GB18030。
 fn fetch_html(url: &str) -> Result<String, FetchError> {
-    let client = reqwest::blocking::Client::builder()
-        .user_agent(UA)
-        .timeout(std::time::Duration::from_secs(20))
-        .build()
-        .map_err(|e| FetchError::Request(format!("创建客户端失败：{}", e)))?;
-    let resp = client
+    let resp = http_client()
         .get(url)
         .send()
         .and_then(|r| r.error_for_status())
@@ -128,8 +167,11 @@ fn charset_from_content_type(ct: &str) -> Option<&'static encoding_rs::Encoding>
 
 /// 提取目录页的书籍标题和章节链接列表。
 pub fn fetch_catalog(url: &str) -> Result<Catalog, FetchError> {
-    let html = fetch_html(url)?;
-    let doc = Html::parse_document(&html);
+    with_retry(|| parse_catalog(&fetch_html(url)?, url))
+}
+
+fn parse_catalog(html: &str, url: &str) -> Result<Catalog, FetchError> {
+    let doc = Html::parse_document(html);
     let base = Url::parse(url).map_err(|e| FetchError::Parse(e.to_string()))?;
 
     let book_title = extract_book_title(&doc).unwrap_or_else(|| fallback_book_title(&doc));
@@ -340,15 +382,39 @@ fn is_nav_title(title: &str) -> bool {
 }
 
 /// 抓单个章节，返回章节名（`h3.j_chapterName`）与正文纯文本。
+///
+/// 站点偶发返回「章节不存在或获取失败！」这类错误页（同一 URL 重试即可恢复），
+/// 因此这里对空正文/错误页做退避重试。
 pub fn fetch_chapter(url: &str) -> Result<ChapterContent, FetchError> {
-    let html = fetch_html(url)?;
-    let doc = Html::parse_document(&html);
+    with_retry(|| parse_chapter(&fetch_html(url)?, url))
+}
+
+fn parse_chapter(html: &str, url: &str) -> Result<ChapterContent, FetchError> {
+    let doc = Html::parse_document(html);
     let title = extract_chapter_title(&doc);
     let content = extract_chapter_body(&doc);
     if content.is_empty() {
-        return Err(FetchError::Parse(format!("未提取到正文内容：{}", url)));
+        return Err(FetchError::Empty(format!("未提取到正文内容：{}", url)));
+    }
+    if is_site_error_page(&content) {
+        return Err(FetchError::Empty(format!(
+            "站点返回错误页「{}」：{}",
+            content, url
+        )));
     }
     Ok(ChapterContent { title, content })
+}
+
+/// 识别站点自己的错误提示页（如「章节不存在或获取失败！」），
+/// 避免把提示语当成正文写进 epub。
+fn is_site_error_page(text: &str) -> bool {
+    let t = text.trim();
+    t.chars().count() < 80
+        && (t.contains("章节不存在")
+            || t.contains("获取失败")
+            || t.contains("页面不存在")
+            || t.contains("内容不存在")
+            || t.contains("章节已删除"))
 }
 
 /// 章节名：优先站点约定的 `h3.j_chapterName`，其次通用标题。
@@ -672,6 +738,14 @@ mod tests {
         assert_eq!(body, "第一段正文。\n第二段正文。");
         assert!(!body.contains('<'));
         assert!(!body.contains("secret"));
+    }
+
+    #[test]
+    fn site_error_page_detection() {
+        assert!(is_site_error_page("章节不存在或获取失败！"));
+        assert!(is_site_error_page("抱歉，页面不存在"));
+        // 正常长正文里出现这些词不应被误判
+        assert!(!is_site_error_page(&"这是一段正常的章节正文内容。".repeat(20)));
     }
 
     #[test]

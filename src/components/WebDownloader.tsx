@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 import { isTauri } from "@/lib/tauri";
 import { countWords } from "@/lib/wordcount";
+import { DEFAULT_THREADS, getThreads } from "@/lib/settings";
 
 type CatalogChapter = { title: string; url: string };
 
@@ -50,9 +51,13 @@ export default function WebDownloader({ onLoaded, active }: Props) {
   const [progress, setProgress] = useState({ done: 0, total: 0 });
   const [savedPath, setSavedPath] = useState<string | null>(null);
   const [failed, setFailed] = useState<FailedChapter[]>([]);
+  const [threads, setThreadsState] = useState(DEFAULT_THREADS);
   const abortRef = useRef(false);
 
   useEffect(() => () => { abortRef.current = true; }, []);
+
+  // localStorage 只能在客户端读取，避免服务端预渲染与水合不一致
+  useEffect(() => setThreadsState(getThreads()), []);
 
   async function handleParse() {
     if (!isTauri()) {
@@ -108,22 +113,66 @@ export default function WebDownloader({ onLoaded, active }: Props) {
     setProgress({ done: 0, total: catalog.chapters.length });
     abortRef.current = false;
 
-    const chapters: WebChapter[] = [];
+    let chapters: WebChapter[] = [];
+    const ordered: (WebChapter | null)[] = new Array(
+      catalog.chapters.length
+    ).fill(null);
     const failures: FailedChapter[] = [];
+    const total = catalog.chapters.length;
+    let nextIndex = 0;
+    let doneCount = 0;
     let written = 0;
+    let flushBusy = false;
+
+    const collected = () =>
+      ordered.filter((c): c is WebChapter => c !== null);
 
     // 把已抓到的章节整体写入 epub（覆盖写）
     const flush = async () => {
+      const list = collected();
       await invoke("generate_epub", {
         path,
         title: catalog.book_title,
         author: null,
-        chapters: chapters.map((c) => ({
+        chapters: list.map((c) => ({
           title: c.title,
           content: c.lines.join("\n"),
         })),
       });
-      written = chapters.length;
+      written = list.length;
+    };
+
+    // 多个工作线程共用一次写盘，避免并发写同一个文件
+    const maybeFlush = async () => {
+      if (flushBusy) return;
+      if (collected().length - written < REWRITE_EVERY) return;
+      flushBusy = true;
+      try {
+        await flush();
+      } finally {
+        flushBusy = false;
+      }
+    };
+
+    const worker = async () => {
+      while (!abortRef.current) {
+        const i = nextIndex++;
+        if (i >= total) return;
+        const ref = catalog.chapters[i];
+        try {
+          const got = await invoke<ChapterContent>("scrape_chapter", {
+            url: ref.url,
+          });
+          const title = (got.title || "").trim() || ref.title;
+          ordered[i] = { title, lines: got.content.split("\n") };
+        } catch (e) {
+          failures.push({ title: ref.title, url: ref.url, reason: errText(e) });
+        }
+        doneCount++;
+        setProgress({ done: doneCount, total });
+        setFailed([...failures]);
+        await maybeFlush();
+      }
     };
 
     try {
@@ -136,28 +185,14 @@ export default function WebDownloader({ onLoaded, active }: Props) {
       });
       setSavedPath(path);
 
-      // 2) 顺序逐章抓取，边抓边写
-      for (let i = 0; i < catalog.chapters.length; i++) {
-        if (abortRef.current) break;
-        const ref = catalog.chapters[i];
-        try {
-          const got = await invoke<ChapterContent>("scrape_chapter", {
-            url: ref.url,
-          });
-          const title = (got.title || "").trim() || ref.title;
-          chapters.push({ title, lines: got.content.split("\n") });
-        } catch (e) {
-          failures.push({ title: ref.title, url: ref.url, reason: errText(e) });
-        }
-        setProgress({ done: i + 1, total: catalog.chapters.length });
-        setFailed([...failures]);
-        if (chapters.length - written >= REWRITE_EVERY) {
-          await flush();
-        }
-      }
+      // 2) 多线程并发抓取，边抓边写
+      await Promise.all(
+        Array.from({ length: Math.min(threads, total) }, () => worker())
+      );
+      chapters = collected();
 
       // 3) 收尾写盘
-      if (chapters.length > written) await flush();
+      if (collected().length > written) await flush();
 
       if (chapters.length === 0) {
         setError("所有章节抓取失败，已保留空白 epub 文件");
@@ -172,7 +207,10 @@ export default function WebDownloader({ onLoaded, active }: Props) {
       ];
       if (failures.length) {
         lines.push("", "失败章节（前 10 条）：");
-        failures.slice(0, 10).forEach((f) => lines.push(`· ${f.title}`));
+        failures.slice(0, 10).forEach((f) => {
+          const reason = f.reason.length > 60 ? f.reason.slice(0, 60) + "…" : f.reason;
+          lines.push(`· ${f.title}（${reason}）`);
+        });
       }
       await message(lines.join("\n"), {
         title: "抓取完成",
@@ -265,16 +303,21 @@ export default function WebDownloader({ onLoaded, active }: Props) {
                 />
               </div>
               <div className="progress-text">
-                {progress.done} / {progress.total}
+                {progress.done} / {progress.total} · {threads} 线程
               </div>
               <button className="btn" onClick={handleStop}>
                 停止
               </button>
             </>
           ) : (
-            <button className="btn primary" onClick={handleDownload}>
-              选择文件夹并开始抓取
-            </button>
+            <>
+              <button className="btn primary" onClick={handleDownload}>
+                选择文件夹并开始抓取（{threads} 线程）
+              </button>
+              <div className="level-hint">
+                并发线程数可在设置中修改，当前 {threads}
+              </div>
+            </>
           )}
         </>
       )}
